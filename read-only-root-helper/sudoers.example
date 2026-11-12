@@ -1,0 +1,4 @@
+<user> ALL=(root) NOPASSWD: /usr/local/lib/agentalsec/read_helper.py sudoers, \
+    /usr/local/lib/agentalsec/read_helper.py root_ssh, \
+    /usr/local/lib/agentalsec/read_helper.py proc_exe, \
+    /usr/local/lib/agentalsec/read_helper.py --verbs

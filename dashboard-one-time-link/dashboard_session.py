@@ -1,0 +1,150 @@
+import hashlib
+import errno
+import hmac
+import json
+import os
+import secrets
+import stat
+import tempfile
+import threading
+import time
+from html import escape
+
+HEADER = "X-Agental-Session"
+STORAGE_KEY = "agental_session"
+LINK_TTL = 120
+SESSION_TTL = 30 * 86400
+
+_used = {}
+_used_lock = threading.Lock()
+
+
+def _mac(api_key: str, purpose: str, body: str) -> str:
+    return hmac.new(api_key.encode("utf-8", "surrogateescape"),
+                    f"{purpose}:{body}".encode(), hashlib.sha256).hexdigest()
+
+
+def _token(api_key: str, purpose: str, now) -> str:
+    body = f"{int(now if now is not None else time.time())}.{secrets.token_hex(8)}"
+    return f"{body}.{_mac(api_key, purpose, body)}"
+
+
+def _check(api_key: str, purpose: str, value, ttl: int, now):
+    if not api_key or not isinstance(value, str) or value.count(".") != 2:
+        return None
+    ts, nonce, mac = value.split(".")
+    if not ts.isdigit() or not hmac.compare_digest(
+            mac.encode("ascii", "replace"),
+            _mac(api_key, purpose, f"{ts}.{nonce}").encode()):
+        return None
+    now = time.time() if now is None else now
+    age = now - int(ts)
+    return int(ts) if -60 <= age <= ttl else None
+
+
+def open_link_token(api_key: str, now=None) -> str:
+    return _token(api_key, "open", now)
+
+
+def _spent_dir() -> str | None:
+    base = os.environ.get("XDG_RUNTIME_DIR") or ""
+    if not os.path.isdir(base):
+        base = tempfile.gettempdir()
+    path = os.path.join(base, f"agentalsec-links-{os.geteuid()}")
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return None
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+        return None
+    return path
+
+
+def _mark_spent(token: str, now: float) -> bool:
+    path = _spent_dir()
+    if not path:
+        return True
+    try:
+        for name in os.listdir(path):
+            old = os.path.join(path, name)
+            try:
+                if now - os.lstat(old).st_mtime > LINK_TTL * 2:
+                    os.unlink(old)
+            except OSError:
+                pass
+        mark = os.path.join(path, hashlib.sha256(token.encode()).hexdigest())
+        os.close(os.open(mark, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+    except FileExistsError:
+        return False
+    except OSError:
+        pass
+    return True
+
+
+def redeem_link(api_key: str, token, now=None) -> bool:
+    if _check(api_key, "open", token, LINK_TTL, now) is None:
+        return False
+    now = time.time() if now is None else now
+    with _used_lock:
+        for old in [t for t, at in _used.items() if now - at > LINK_TTL * 2]:
+            del _used[old]
+        if token in _used:
+            return False
+        _used[token] = now
+        return _mark_spent(token, now)
+
+
+def new_session(api_key: str, now=None) -> str:
+    return _token(api_key, "session", now)
+
+
+def session_valid(api_key: str, value, now=None) -> bool:
+    return _check(api_key, "session", value, SESSION_TTL, now) is not None
+
+
+def handoff_page(session: str, nonce: str) -> str:
+    value = json.dumps(session).replace("</", "<\\/")
+    key = json.dumps(STORAGE_KEY)
+    return ('<!doctype html><meta charset="utf-8"><title>AgentalSec</title>'
+            f'<script nonce="{nonce}">try {{ localStorage.setItem({key}, '
+            f'{value}); }} catch (e) {{}} location.replace("/");</script>\n')
+
+
+def write_opener(url: str, owner_uid=None) -> str:
+    run_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if owner_uid is not None and os.path.isdir(f"/run/user/{owner_uid}"):
+        run_dir = f"/run/user/{owner_uid}"
+    if not (run_dir and os.path.isdir(run_dir)):
+        run_dir = None
+    try:
+        fd, path = tempfile.mkstemp(prefix="agentalsec-open-", suffix=".html",
+                                    dir=run_dir)
+    except OSError as e:
+        if not run_dir or e.errno not in (errno.EACCES, errno.EROFS, errno.ENOENT):
+            raise
+        fd, path = tempfile.mkstemp(prefix="agentalsec-open-", suffix=".html")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        u = escape(url, quote=True)
+        fh.write('<!doctype html><meta charset="utf-8">'
+                 f'<meta http-equiv="refresh" content="0;url={u}">'
+                 f'<title>AgentalSec</title><a href="{u}">Open AgentalSec</a>\n')
+    if owner_uid is not None and os.geteuid() == 0:
+        import pwd
+        os.chown(path, owner_uid, pwd.getpwuid(owner_uid).pw_gid)
+    timer = threading.Timer(LINK_TTL, _remove, args=(path,))
+    timer.daemon = True
+    timer.start()
+    return path
+
+
+def _remove(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
